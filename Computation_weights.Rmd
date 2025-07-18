@@ -1,0 +1,614 @@
+---
+output: 
+  pdf_document:
+    keep_tex: true
+    extra_dependencies: ["mathrsfs"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(survival);library(MASS);library(pracma);library(xtable);library(kableExtra);library(tibble)
+```
+
+\newcommand{\B}{\text{B}}
+\newcommand{\N}{\text{N}}
+
+```{=latex}
+\renewcommand{\thesection}{S2.\arabic{section}}
+```
+
+This appendix aims to illustrate how the weights of the 
+methods in section \textcolor{blue}{2.3} can be computed. The R-code of this document is available on
+GitHub (<https://github.com/ww08/Paper_HIPCW/blob/main/weights.R>). 
+
+\subsection{Data-generating mechanism}
+We will employ the data-generating mechanism that was described in
+subsection \textcolor{blue}{2.4.1}. Below, we first set the parameters to the values that
+correspond to the second simulation of subsection \textcolor{blue}{2.4.3} setting and subsequently assign to
+each individual a treatment  (\texttt{A}) and a baseline covariate value (\texttt{L}). 
+
+```{r,echo=TRUE}
+## Set the seed to a number for replication purposes.
+set.seed(0)
+## We will work with 250 individuals and with a true treatment coefficient of -0.4.
+## The other parameter values are those of the second simulation setting of subsection
+## 2.4.3.
+n<-250; bas_haz_out<--3.5; coef_trt_out<--0.4; bas_haz_cens<--6.25 
+censoring_strength_trt<-0.3; censoring_strength_bas_cov<-0.4 
+censoring_strength_time_varying_covariate<-0; cens_interaction<-1.5 
+delta<-0.3; sigmoid_type<-0; shape<-2; max_fup<-2000 
+## Randomised treatment indicator 
+A<-rbinom(n,size=1,prob=1/2)
+## and normally distributed baseline covariate L.
+mu<--5; sigma<-1/4; L<-rnorm(n,mu,sigma)
+```
+Next, we generate event times. For each individual, we keep on drawing event times as long as the cumulative event time does not exceed the maximum follow-up time $\tau$. Here, by cumulative event time, we mean the sum of the separate event time draws.
+```{r, echo=TRUE}
+## Function that keeps on generating event times for each individual as long as the
+## cumulative event time does not exceed the prespecified maximum follow-up time.
+create_event_times<-function(n,A,L,max_fup,bas_haz_out,coef_trt_out,shape){
+  ## Assign a frailty value to each individual.
+  frailty<-rgamma(n,shape=shape,scale=1/shape)
+  ## Draw event times for each individual, and store
+  ## those of individual sigma in event_times[[sigma]].
+  event_times<-lapply(1:n,function(sigma){
+    ## Create a vector in which the times to the j-th
+    ## event of individual sigma will be stored. 
+    vector_of_event_times_per_individual<-c()
+    ## Initially, the cumulative event time equals 0.
+    cumulative_event_time<-0 
+    ## Draw event times as long as the cumulative event time is smaller than the 
+    ## prespecified maximum follow-up time.
+    while(cumulative_event_time<max_fup){
+      ## Generate one single event time.
+      y<-rexp(1,rate=exp(bas_haz_out+coef_trt_out*A[sigma]+0.5*L[sigma])*frailty[sigma])
+      ## Auxiliary variable for later use.
+      aux_var<-length(vector_of_event_times_per_individual) 
+      ## Check whether the current cumulative event time added to the drawn event time
+      ## does not exceed the prespecified maximum follow-up time.
+      if(y<(max_fup-ifelse(aux_var!=0,vector_of_event_times_per_individual[aux_var],0))){
+        ## The drawn event time occurs before the maximum follow-up time, and can be 
+        ## added to the vector of event times.
+        vector_of_event_times_per_individual<-c(vector_of_event_times_per_individual,
+          y+ifelse(aux_var!=0,vector_of_event_times_per_individual[aux_var],0))}
+      ## Regardless of whether the drawn event time fitted within the prespecified
+      ## observation period, we have to redetermine the cumulative event time as it 
+      ## serves as condition in the while statement.
+      cumulative_event_time<-cumulative_event_time+y
+    }
+    ## Return the event times for individual sigma.
+    return(vector_of_event_times_per_individual)})
+  ## Return the list of event times for all individuals.
+  return(event_times)}
+```
+
+Once the event times have been generated, we determine for each individual his/her censoring time. In the simulations of section \textcolor{blue}{2.4} we make (a transformation of) the number of events one experienced prior to time point $t$, i.e. $N_R(t-)$, predictive for the time to censoring. The code below draws a censoring time for each individual by taking into account that the rate parameter of getting censored changes at each of the time points at which an individual experiences an event. More precisely, if $t^{\dagger}$ were a point in time at which an individual experiences an event, then his/her rate of getting censored changes from an infinitesimal right of $t^{\dagger}$ onwards. 
+
+```{r,echo=TRUE}
+## Auxiliary function that determines how the number of events experienced by each
+## time point acts on the hazard of getting censored.
+transf<-function(x,delta,sigmoid_type){
+  if(sigmoid_type==0){return(erf(delta*x*sqrt(pi)/2))}else{return(delta*x/(1+delta*x))}}
+## Function that simulates a censoring time for each individual.
+simulate_censoring_times<-
+  function(n,A,L,max_fup,event_times,bas_haz_cens,censoring_strength_trt,
+           censoring_strength_bas_cov,censoring_strength_time_varying_covariate,
+           cens_interaction,delta,sigmoid_type){
+  ## Add the prespecified maximum follow-up time for each individual to `event_times'. 
+  ## This will prove useful later, though know that this maximum  follow-up time does 
+  ## not correspond to an event time.
+  event_times<-lapply(1:n,function(sigma){
+    if(length(event_times[[sigma]])>0){
+    ## Individual sigma had previous events.
+      return(c(event_times[[sigma]],max_fup))
+    }else{
+    ## Individual sigma had no events.
+      return(max_fup)}})
+  ## Assign a censoring time to each individual. To that end, draw a censoring time with
+  ## the initial rate parameter. If the censoring time is smaller than the first event
+  ## time, retain the censoring time. Otherwise, adapt the rate parameter and draw a new
+  ## censoring time. If this censoring time is smaller than the second event time, retain
+  ## it. Otherwise, adapt the rate parameter again and draw a new censoring time. Keep
+  ## repeating this procedure until a censoring time is assigned to individual sigma.
+  return(sapply(1:n,function(sigma){
+    ## The initial number of events (called `j') are initially 0, and so is the 
+    ## cumulative censoring time.
+    j<-0;cumulative_time<-0
+    ## Go through the event times as long as the drawn censoring time is bigger than
+    ## the j-th event time.
+    while(j<=(length(event_times[[sigma]])-1)){
+      ## Draw a censoring time given that individual sigma already experienced j events.
+      current_time<-
+       rexp(1,rate=exp(bas_haz_cens+censoring_strength_trt*A[sigma]+
+            censoring_strength_bas_cov*L[sigma]+
+            censoring_strength_time_varying_covariate*
+            transf(j,delta,sigmoid_type)+
+            cens_interaction*A[sigma]*transf(j,delta,sigmoid_type)))
+      ## Add the censoring time to the cumulative censoring time.
+      cumulative_time<-cumulative_time+current_time
+      ## Determine whether individual sigma is uncensored at the (j+1)-th event time.
+      if(cumulative_time>event_times[[sigma]][j+1]){ 
+        ## Reset the cumulative censoring time to the (j+1)-th event time.
+        cumulative_time<-event_times[[sigma]][j+1]
+      }else{ 
+        ## Individual sigma is censored before the j-th event time. 
+        ## Return the censoring time.
+        return(cumulative_time)
+      }
+      ## Go to the next event time if no censoring time was assigned yet.
+      j<-j+1
+    }
+    ## Individuals pass the entire while statement when they do not get censored before
+    ## the maximum follow-up time. Their censoring time equals the maximum follow-up time.
+    return(cumulative_time)}))}
+```
+
+Both the event times and censoring times for each individual are now known. Although, we can only observe the event times that occur before an individual gets censored. Therefore, the code below restricts the original list of event times to the event times that occur before one gets censored.
+
+```{r,echo=TRUE}
+## Function that restricts the originally drawn event times to the event times that occur
+## before one gets censored.
+restrict_event_times_to_events_before_censoring_times<-
+  function(n,event_times,censoring_times){
+  event_times<-lapply(1:n,function(sigma){
+    ## Determine the index in event_times[[sigma]] that corresponds to the largest event
+    ## time that is smaller than the censoring time of individual sigma.
+    aux_var<-findInterval(censoring_times[sigma],event_times[[sigma]])
+    ## Determine whether there are event times before the first censoring time.
+    if(aux_var>0){
+      ## There are event times before the first censoring time.
+        return(event_times[[sigma]][1:aux_var])
+      }else{
+      ## There are no events before the censoring time.
+        return(NULL)
+    }})
+  ## Return the observed event times along with the censoring times.
+  return(list(event_times,censoring_times))}
+```
+
+Given the observed data that are now fully determined, we create a dataset \texttt{data.event.times} that next to the baseline covariates stores the first, second, third, ... event times for each individual. When an individual did not experience a j\textsuperscript{th} event, his/her j\textsuperscript{th} event time is set to NA. This dataset will be very useful to construct the long data frame format required for fitting Cox proportional hazards models from which the (H)IPCW weights will be derived.
+
+```{r,echo=TRUE}
+## Function that converts the observed data to the format alluded to above. 
+create_dataset_time_to_j_th_event<-function(n,list,max_fup){
+    ## The observed event times are stored in the first entry of `list'. The censoring
+    ## times are stored in the second entry of `list'.
+    list_event_times<-list[[1]]; fup<-list[[2]]
+    ## The indicator cens.time equals the censoring time when individual sigma is
+    ## censored and NA when s/he reaches the prespecified maximum follow-up time.
+    cens.time<-sapply(1:n,function(sigma){
+      if(fup[sigma]!=max_fup){return(fup[sigma])}else{return(NA)}})
+    ## Determine the maximum number of events that an individual experienced so that
+    ## the number of covariates which store the event times can be determined.
+    number_of_covariates<-max(sapply(1:n,function(sigma){
+     return(length(list_event_times[[sigma]]))})) 
+    ## Assign covariate names for the time to the j-th event.
+    covariate_names<-
+      sapply(1:number_of_covariates,function(rho){
+        paste("event.dt.",rho,sep="")})
+    ## Convert the original list of event times to a list of event times where entry
+    ## kappa corresponds to a vector of length n where in position lambda event time
+    ## kappa of individual lambda is stored. If individual lambda did not experience
+    ## such event, then index lambda in entry kappa is set to NA. This format allows
+    ## to construct the dataset data.event.times.
+    list_with_event_times<-
+      lapply(1:number_of_covariates,function(kappa){
+      return(sapply(1:n,function(lambda){
+        ## Check whether individual lambda experienced at least kappa events.
+        if(kappa<=length(list_event_times[[lambda]])){
+          ## Select event time kappa of individual lambda.
+          return(list_event_times[[lambda]][kappa])
+          }else{
+          ## Individual lambda did not experience kappa events.
+          return(NA)}}))})
+    ## Use `list_with_event_times' to create the envisaged data frame. Add a subject
+    ## identifier, the indicator cens.time, along with the follow-up time.
+    data<-data.frame(cbind(1:n,data.frame(do.call("cbind",list_with_event_times)),
+                     cens.time,fup))
+    colnames(data)<-c("id",covariate_names,"cens.time","fup")
+    ## Return the resulting data frame.
+    return(data)}
+```
+
+For illustration, we show how the data so far look like. Notice that the columns which store the time to late events seem empty. This is because none of the first 10 individuals experience 10 or more events.
+```{r, echo=TRUE}
+## Generate event times for each individual.
+event_times<-create_event_times(n,A,L,max_fup,bas_haz_out,coef_trt_out,shape)
+## Generate censoring times for each individual.
+cens_times<-simulate_censoring_times(n,A,L,max_fup,event_times,bas_haz_cens,
+                                     censoring_strength_trt,censoring_strength_bas_cov,
+                                     censoring_strength_time_varying_covariate,
+                                     cens_interaction,delta,sigmoid_type)
+## Restrict the event times to those which occur before one gets censored.
+list<-restrict_event_times_to_events_before_censoring_times(n,event_times,cens_times)
+## Turn the observed data in the desired format.
+data.event.time.covariates<-
+  create_dataset_time_to_j_th_event(n,list,max_fup)
+## Show part of data.event.time.covariates for illustration.
+data.event.time.covariates[1:10,]
+```
+
+The code below uses the function \texttt{tmerge()} to convert \texttt{data.event.time} \texttt{.covariates} to a data frame where the observation period of each individual is splitted at the points in time at which s/he experiences an event. This gives rise to a dataset with subintervals where the right endpoint of each interval corresponds to an event time, except the endpoint of each individual's last interval which either corresponds to the point in time at which s/he gets censored or to his/her prespecified maximum follow-up time $\tau$. The left/right endpoint of these subintervals are called in this dataset \texttt{tstart}/\texttt{tstop}. We also add a censoring indicator \texttt{cens} which expresses whether an individual gets censored at the corresponding right endpoint. We also include an event indicator \texttt{event} which expresses whether an individual experiences an event at the corresponding right endpoint. We also store the follow-up time for each individual in the variable \texttt{fup}. Next to these variables, this dataset also includes the treatment variable \texttt{A}, the baseline covariate \texttt{L}, and the subject identifier \texttt{id}. 
+
+```{r, echo=TRUE}
+## Start from a dataset that includes the subject identifier `id', the treatment variable
+## `A', a baseline covariate `L' and the follow-up time `fup'.
+data.baseline<-data.frame("id"=1:n,"A"=A,"L"=L,"fup"=data.event.time.covariates[,
+                           ncol(data.event.time.covariates)])
+## Determine the observation period of each individual, marked by `tstart' and `tstop'.
+new.data<-tmerge(data.baseline,data.event.time.covariates,id=id,tstop=fup) 
+## Split each individual's time window in subintervals of which each right endpoint
+## corresponds to an event time.
+for(l in 2:(ncol(data.event.time.covariates)-2)){
+  cov<-names(data.event.time.covariates)[l]
+  new.data<-tmerge(new.data,data.event.time.covariates,id=id,
+                   event=event(data.event.time.covariates[,cov]))}
+## Add an indicator `cens' which expresses whether an individual gets censored at the
+## corresponding right endpoint.
+new.data<-tmerge(new.data,data.event.time.covariates,id=id,cens=event(cens.time))
+## Show for illustration the first 50 lines of new.data.
+new.data[1:50,]
+```
+
+This format does not yet suffice to compute the weights. This is because a Cox proportional hazards model requires a dataset where the observation period of each individual is splitted across all time points at which someone gets censored. We will however split the observation period of each individual across all time points at which either someone experiences an event or at which someone gets censored. This will prove useful later. In addition, to fit the Cox proportional hazards model, we also need a time-varying covariate \texttt{n.event} which indicates at each subinterval's stopping time the number of events one experienced since the start of the study until just before that stopping time. This is because the probability to remain uncensored until a time point $t$ depends on $N_{R}(t-)$. We start off describing how \texttt{new.data} can be easily converted to the desired format and subsequently show how this format exactly looks like.
+
+### Converting \texttt{new.data} to long format
+
+We use the \texttt{survSplit()} function of the \texttt{survival} package to split the observation period of each individual across all time points at which someone gets censored or at which someone experiences an event. This can be achieved via the code below. 
+
+<!-- TURN DATA INTO THE DESIRED FORMAT SO THAT SURVSPLIT CAN BE APPLIED TO IT -->
+
+```{r,echo=TRUE}
+## Determine the time points at which individuals either experience events or 
+## get censored or reach the prespecified follow-up time.
+cutting_times<-sort(unique(new.data$tstop))
+## Create an indicator `event' which indicates whether an individual had an event
+## at `cutting_times'.
+data.long<-survSplit(new.data,cut=cutting_times,start="tstart",end="tstop",event="event") 
+## Determine the number of events one experienced by time point tstop.
+n.event<-ave(data.long$event,data.long$id,FUN=cumsum) 
+## Determine the indices of data.long where the subject identifier changes. 
+## Add nrow(data.long)+1 as additional index for later use.
+indices<-c(which(data.long$tstart==0),nrow(data.long)+1)
+## The censoring model requires at the right endpoint of each subinterval the number of
+## events one experienced by time point t-.
+data.long$n.event<-unlist(lapply(1:n,function(sigma){
+  if(length((indices[sigma]):(indices[sigma+1]))==2){
+    ## Individual sigma gets immediately censored at the end of the first subinterval
+    ## and therefore cannot experience any event.
+    return(0)
+  }else{ 
+    ## Individual sigma has at least two time intervals in data.long.
+    return(c(0,n.event[(indices[sigma]):(indices[sigma+1]-2)]))}}))
+## Create an indicator `cens' which represents at which cutting time an individual
+## was censored.
+data.long.cens<-survSplit(new.data,cut=cutting_times,start="tstart",end="tstop",
+                          event="cens")
+## Define the correct censoring indicator of data.long.
+data.long$cens<-data.long.cens$cens
+## Show part of data.long for illustration.
+data.long[1:50,]
+```
+
+### Fitting the censoring model
+
+The code below illustrates how \texttt{data.long} can be employed to fit a Cox proportional hazards model
+\begin{itemize}
+  \item that includes treatment \texttt{A}, the baseline covariate \texttt{L} and a transformation of the time-varying covariate \texttt{n.event}, from which unstabilised weights can be computed.
+  \item that includes treatment \texttt{A} and the baseline covariate \texttt{L} so that the aforementioned weights can be stabilised.
+\end{itemize}
+```{r,echo=TRUE,warning=FALSE}
+## Function that returns the censoring model from which unstabilised weights
+## can be derived.
+determine_censoring_model_time_varying_covariates<-
+  function(data.long,delta,sigmoid_type){
+    return(coxph(Surv(tstart,tstop,cens)~A+L+transf(n.event,delta,sigmoid_type)+
+                 A*transf(n.event,delta,sigmoid_type),id=id,data=data.long,
+                 control=coxph.control(timefix=FALSE)))}
+## Function that returns the censoring model so that the aforementioned weights can be
+## stabilised.
+determine_censoring_model_baseline_covariates<-
+  function(data.long){
+    return(coxph(Surv(tstart,tstop,cens)~A+L,id=id,data=data.long,
+                 control=coxph.control(timefix=FALSE)))}
+```
+
+Once a censoring model is fitted, it can be employed to compute IPCW weights.
+
+### Computing IPCW weights at each of the splitting time points
+
+The code below shows how IPCW weights at each of the splitting time points at which one is uncensored can be computed by using the \texttt{survfit()} function of the \texttt{survival} package. In this appendix, we will limit ourselves to computing stabilised weights. Unstabilised weights can be computed in a similar way.
+```{r,echo=TRUE}
+## Function that computes stabilised weights at each of the splitting time points.
+determine_IPCW_stabilised<-
+  function(n,data.long,cens_mod_baseline_covariates,
+           cens_mod_time_varying_covariates,indices){
+  ## Compute stabilised IPCW weights at each of the splitting time points.
+  return(do.call("rbind",lapply(1:n,function(sigma){
+    ## Consider the data of individual sigma.
+    current_data<-data.long[(indices[sigma]):(indices[sigma+1]-1),]
+    ## The path of the time-varying covariate must be specified in the `newdata' argument
+    ## of survfit() to obtain correct survival probabilities! Moreover, we use the `times'
+    ## argument so that the weights are computed at each of the  splitting time points.
+    current_data$Stab_IPCW<-
+     summary(survfit(cens_mod_baseline_covariates,newdata=current_data,id=id,
+                     timefix=FALSE),times=current_data$tstop)$surv*
+     1/summary(survfit(
+                    cens_mod_time_varying_covariates,newdata=current_data,id=id,
+                    timefix=FALSE),times=current_data$tstop)$surv
+    ## Return the data of individual sigma along with stabilised IPCW weights at 
+    ## each of the splitting time points at which s/he is uncensored.
+    return(current_data)})))}
+```
+
+The functions of the foregoing and the current subsection are now employed to compute stabilised IPCW weights at each of the splitting time points at which one is uncensored.
+
+```{r, echo=TRUE}
+## Fit a censoring model that only includes baseline covariates.
+cens_mod_baseline_covariates<-determine_censoring_model_baseline_covariates(data.long)
+## Fit a censoring model that includes both baseline and time-varying covariates.
+cens_mod_time_varying_covariates<-
+  determine_censoring_model_time_varying_covariates(data.long,delta,sigmoid_type)
+## Assign to each individual stabilised IPCW weights at each of the splitting
+## time points at which one is uncensored.
+data.long.Stab<-determine_IPCW_stabilised(n,data.long,cens_mod_baseline_covariates,
+                                          cens_mod_time_varying_covariates,indices)
+## Show part of data.long.Stab for illustration.
+data.long.Stab[1:50,]
+```
+
+We now have all means at our disposal to estimate the effect of treatment on a recurrent event process under dependent censoring by using the methods outlined in section \textcolor{blue}{2.3}. We describe this in detail in the three subsections below.
+
+### An IPCW-based approach to estimate the treatment effect at a fixed point in time $\tau^{\star}$
+Consider a fixed point in time $\tau^{\star} \leq \tau$ at which one aims to estimate the treatment effect. For each individual who is still uncensored at that point in time, his/her covariate values that correspond to time point $\tau^{\star}$ can be selected from the time window of which the stopping time is the first one that exceeds time point $\tau^{\star}$. For each such individual, the IPCW weight that corresponds to time point $\tau^{\star}$ is the one from the time window of which the stopping time is the last one that preceeds time point $\tau^{\star}$. The conversion from the long data frame \texttt{data.long} to the wide data frame that only includes individuals who are uncensored at time point $\tau^{\star}$ together with the correct IPCW weight can be achieved via the code below.
+
+```{r,echo=TRUE}
+## Function that converts data.long to a wide data frame format that only includes
+## individuals who are uncensored at time point tau^star along with the correct covariate
+## values and IPCW weights.
+create_uncensored_wide_data_frame_at_a_given_time<-
+  function(data.long.Stab,cutting_times,tau_star,max_fup){
+  ## Determine the row index at which we find the smallest cutting time
+  ## (in the column tstop) bigger than tau^star. Notice that this index is the same
+  ## for all individuals that are uncensored at time point tau^star when one restricts
+  ## `data.long.Stab' to the records of individual sigma. 
+  row_index_smallest_time_bigger_than_tau_star<-
+    findInterval(tau_star,cutting_times)+
+    if(cutting_times[findInterval(tau_star,cutting_times)]==max_fup){0}else{1}
+  ## Check whether the fixed time point tau^star is strictly smaller than the maximum
+  ## follow-up time.
+  if(cutting_times[row_index_smallest_time_bigger_than_tau_star]!=max_fup){
+  ## Restrict data.long to subjects whose censoring time lies beyond time point tau^star.
+  current_data<-subset(data.long.Stab,id %in% unique((data.long.Stab[
+                       which(data.long.Stab$fup>tau_star),])$id))
+  ## Determine the row indices at which the identifier variable changes in
+  ## `current_data'. Add nrow(current_data)+1 as additional index for later use.
+  indices_current_data<-c(which(current_data$tstart==0),nrow(current_data)+1) 
+  ## Select for each individual the covariate values that correspond to time point
+  ## tau^star along with the correct IPCW weight.
+  return(do.call("rbind",lapply(1:(length(indices_current_data)-1),
+      function(sigma){
+  ## Restrict `current_data' to the data of individual sigma.
+      aux_data<-current_data[(indices_current_data[sigma]):
+(indices_current_data[sigma+1]-1),]
+  ## We need the weight for individual sigma at the last cutting time (in the column
+  ## tstop) which preceeds time point tau^star, but the records for that individual at
+  ## the first cutting time (in the column tstop) which exceeds time point tau^star.
+      final_data<-aux_data[row_index_smallest_time_bigger_than_tau_star,]
+      final_data[,"Stab_IPCW"]<-if(row_index_smallest_time_bigger_than_tau_star>1){
+         aux_data[row_index_smallest_time_bigger_than_tau_star-1,"Stab_IPCW"]}else{1}
+   ## Return the data for individual sigma.
+      return(final_data)})))
+  }else{
+    ## The fixed time point tau^star equals either the maximum follow-up time or is
+    ## located between the penultimate and the ultimate cutting time. Here, the ultimate
+    ## cutting time is the prespecified maximum follow-up time. For both scenarios, we
+    ## can restrict us to the individuals who are uncensored at the prespecified maximum
+    ## follow-up time as neither censoring nor an event can occur within this last time
+    ## window.
+    return(subset(data.long.Stab,data.long.Stab$tstop==max_fup))}}
+```
+
+We apply this method for illustration for $\tau^{\star}=1500$.
+```{r,echo=TRUE}
+## Select for each uncensored individual at time point tau^star the covariate values
+## that correspond to that time point along with the correct IPCW weight.
+data.wide.Stab<-create_uncensored_wide_data_frame_at_a_given_time(
+                data.long.Stab,cutting_times,1500,max_fup)
+## Show part of data.wide.Stab for illustration.
+data.wide.Stab[1:20,]
+```
+This dataset can now be immediately employed to fit a weighted Poisson or Negative Binomial regression with weights the IPCW weights. This delivers the envisaged estimate of treatment effect.
+
+### An IPCW-GEE-based approach to estimate the treatment effect
+Consider an equidistant partition $\Pi = \{t_0,t_1,t_2,\dots,t_k\}$ of $\mathscr{T}=[0,\tau]$, with $t_0=0$,$t_k=\tau$ and $t_j-t_{j-1}=\frac{\tau}{k}$. (The code in this subsection can be adapted to non-equidistant partitions as well.) We aim to estimate the treatment effect by utilising for each individual the number of events s/he experienced by each of the partition points in time at which s/he is still uncensored. To that end, we first build a balanced data frame \texttt{data.long.balanced} where the \texttt{n.event} column explicates for each of the a priori specified time windows $]t_{j-1},t_j], j=1,\dots,k$ how many events one experienced by the corresponding stopping time point. This can be achieved via the code below.
+
+```{r,echo=TRUE}
+## Function that converts data.long into a balanced data frame format where for each
+## individual each time window is of the form ]t_{j-1},t_{j}]. For such time window,
+## n.event equals the number of events one experienced by time point t_j.
+convert_long_data_frame_to_balanced_format<-
+  function(n,data.long,set_of_partition_points,indices,cutting_times,max_fup,increment){
+    ## set_of_partition_points: these are the partition
+    ## time points t_1,t_2,...,t_k.
+    ## increment: this is the fixed length of a time window.
+    data.long.balanced<-lapply(1:n,function(sigma){
+    ## Determine for individual sigma the index of the
+    ## largest visit time in `set_of_partition_points'
+    ## at which s/he is still uncensored.
+    aux_var<-findInterval(data.long[indices[sigma],"fup"],set_of_partition_points) 
+    if(aux_var>0){ 
+      ## Individual sigma does not get censored before the first visit time. Note that
+      ## the first visit time is assumed to be strictly larger than 0. Continue by
+      ## defining the partition points at which individual sigma is observed.
+      set_of_partition_points_for_ind_sigma<-set_of_partition_points[1:aux_var] 
+      ## The relevant data in long format for individual sigma.
+      current_data<-
+        data.long[(indices[sigma]):(indices[sigma+1]-1),c("id","A","L","n.event","cens")]
+      ## Determine the records of individual sigma at
+      ## the visit times.
+      list_of_data_at_visit_times<-lapply(1:(length(
+        set_of_partition_points_for_ind_sigma)),
+          function(rho){
+          ## Go through all visit times for individual sigma. Determine the index of the
+          ## largest cutting time smaller than the rho-th visit time in 
+          ## `set_of_partition_points_for_ind_sigma'. 
+          aux_var<-findInterval(set_of_partition_points_for_ind_sigma[rho],cutting_times)
+        ## Records of individual sigma corresponding to visit time rho. Go one line
+        ## deeper than `aux_var' (if possible) to get the number of events one
+        ## experienced by the rho-th visit time.
+        data_at_visit_times<-current_data[
+          if(aux_var>0){
+            ## Verify whether there are cutting times before visit time rho.
+            aux_var+if(cutting_times[aux_var]!=max_fup){1}else{0}}else{1},] 
+         return(data_at_visit_times)
+      })
+      ## Convert `list_of_data_at_visit_times' to a data frame via row binding.
+      balanced_data_for_ind_sigma<-do.call("rbind",list_of_data_at_visit_times)
+      ## Add a column tstart representing the starting time point of each subinterval.
+      balanced_data_for_ind_sigma$tstart<-
+        if(length(set_of_partition_points_for_ind_sigma)>1){
+          c(0,set_of_partition_points_for_ind_sigma[1:
+           (length(set_of_partition_points_for_ind_sigma)-1)])}
+        else{0}
+      ## Add a column tstop representing the stopping time point of each subinterval.
+      balanced_data_for_ind_sigma$tstop<-set_of_partition_points_for_ind_sigma
+      ## Return the data in balanced format for individual sigma.
+      return(balanced_data_for_ind_sigma)}
+      ## No else branche as individual sigma gets censored before the first visit time, 
+      ## and therefore will be discarded from the GEE-analysis.
+  })
+  ## Bind the balanced datasets for each individual together in one balanced data frame.
+  return(do.call("rbind",data.long.balanced))}
+```
+
+The desired balanced long data frame format that the function here above delivers still lacks IPCW weights at each of the partition time points. These weights can however be easily added to the resulting dataset by extracting them from \texttt{data.long.Stab}. This can be achieved via the function below.
+
+```{r,echo=TRUE}
+## Function that adds IPCW weights at each of the partition time points at which
+## individuals are uncensored.
+add_IPCW_weights_at_each_of_the_partition_time_points<-
+  function(n,data.long.Stab,set_of_partition_points,indices,cutting_times,max_fup,
+           increment){
+  ## Construct data.long.balanced from data.long.Stab.
+  data.long.balanced<-convert_long_data_frame_to_balanced_format(
+      n,data.long.Stab,set_of_partition_points,indices,cutting_times,max_fup,increment)
+  ## Determine the indices of data.long.balanced where the subject identifier changes.
+  ## Add nrow(data.long.balanced)+1 as additional index for later use.
+  indices.data.long.balanced<-
+    c(which(data.long.balanced$tstart==0),nrow(data.long.balanced)+1)
+  ## Determine the stabilised IPCW weights for each individual at each of the partition
+  ## time points.
+  Stab.IPCW<-unlist(sapply(1:(length(indices.data.long.balanced)-1),function(sigma){
+    ## The relevant data in balanced format for individual sigma.
+    current.data.balanced<-data.long.balanced[
+      (indices.data.long.balanced[sigma]):(indices.data.long.balanced[sigma+1]-1),]
+    ## Note that individual sigma in data.long.balanced may differ from individual
+    ## sigma in data.long.Stab as individuals who get censored  before the first visit
+    ## time are discarded from  the GEE-analysis. We therefore have to determine the id
+    ## variable of individual sigma in data.long.Stab.
+    sigma_bis<-unique(current.data.balanced[,"id"])
+    ## Consider the data of individual sigma in data.long.Stab.
+    current.data.long.Stab<-data.long.Stab[(indices[sigma_bis]):(indices[sigma_bis+1]-1),]
+    ## Determine the correct IPCW weights at each of the partition time points.
+    return(sapply(1:(nrow(current.data.balanced)),
+      function(rho){
+      ## Determine the largest cutting time (in the column tstop) smaller than
+      ## the rho-th visit time. At this line, the correct IPCW weight can be extracted.
+      aux_var<-findInterval(
+        current.data.balanced[rho,"tstop"],current.data.long.Stab[,"tstop"])
+      ## Verify whether there is a cutting time before the rho-th visit time.
+      if(aux_var>0){
+        return(current.data.long.Stab[aux_var,"Stab_IPCW"])}else{return(1)}}))}))
+  ## Add the correct stabilised IPCW weights to data.long.balanced.
+  data.long.balanced$Stab_IPCW<-Stab.IPCW
+  ## Return data.long.balanced.
+  return(data.long.balanced)}
+```
+
+We now apply the above method for $\texttt{increment}=50$.
+
+```{r, echo=TRUE}
+## Construct a balanced data frame with at each of the partition time points at which
+## one is uncensored the correct IPCW weights.
+data.long.balanced.Stab<-
+ add_IPCW_weights_at_each_of_the_partition_time_points(
+   n,data.long.Stab,seq(50,2000,by=50),indices,cutting_times,max_fup,50)
+## Show for illustration part of data.long.balanced.Stab.
+data.long.balanced.Stab[1:50,]
+```
+
+This dataset can now be immediately employed to fit a weighted Poisson-GEE with weights the IPCW weights. This delivers the envisaged estimate of treatment effect.
+
+### An HIPCW-based approach to estimate the treatment effect
+
+We now aim to estimate the treatment effect by using for each individual the records at the last point in time one is uncensored. They can be found in each individual's last time window of \texttt{data.long.Stab}. We assign stabilised HIPCW weights to each individual by noting that they factorise into the stabilised IPCW weights and the ratio of the hazard of getting censored given treatment and baseline covariates to the hazard of getting censored given the covariate history. The former have already been calculated and are saved in \texttt{data.long.Stab}. As we are considering the last point in time at which one is uncensored, the correct IPCW weight can be found at the penultimate time window of each individual. Once this first factor has been selected, it can be immediately multiplied by the aforementioned second factor which can be computed by using the regression coefficients of the Cox models \texttt{cens\_mod\_baseline\_covariates} and \texttt{cens\_mod\_time\_varying\_covariates}. Note that for individuals who reach the prespecified follow-up time, the stabilised HIPCW weights coincide with the stabilised IPCW weights and therefore do not require
+any modification. The code below illustrates how the stabilised HIPCW weights can be computed.
+
+```{r,echo=TRUE}
+## Function that returns the covariate values at the last point in time one is
+## uncensored, along with stabilised HIPCW weights.
+create_data_frame_last_time_records_and_HIPCW_weights<-
+  function(n,data.long.Stab,delta,sigmoid_type){
+  ## We will need the regression coefficients of the Cox models that were fitted before.
+  coef_bas_cov<-cens_mod_baseline_covariates[["coefficients"]]
+  coef_time_varying_cov<-cens_mod_time_varying_covariates[["coefficients"]]
+  ## Build a wide data format that contains for each individual the records at the last
+  ## point in time one was uncensored, along with stabilised HIPCW weights.
+  return(do.call("rbind",lapply(1:n,function(sigma){
+    ## Restrict data.long.Stab to the measurements of individual sigma.
+    current_dataset<-subset(data.long.Stab,id==sigma)
+    n_of_rows<-nrow(current_dataset)
+    if((current_dataset[n_of_rows,"cens"])==1){
+      ## Individual sigma gets censored before the prespecified maximum follow-up time.
+      ## The records at the last point in time individual sigma is uncensored can be
+      ## found at the last time window of that individual.
+      data.wide<-current_dataset[n_of_rows,]
+      if(n_of_rows>1){
+        ## Individual sigma has previous uncensored time points. The correct IPCW weight
+        ## for that individual is saved in his/her penultimate time window, but has to be
+        ## adapted appropriately to obtain correct HIPCW weights.
+        data.wide[,"Stab_HIPCW"]<-current_dataset[n_of_rows-1,"Stab_IPCW"]*(
+          exp(coef_bas_cov[["A"]]*data.wide$A+coef_bas_cov[["L"]]*data.wide$L))/(
+          exp(coef_time_varying_cov[["A"]]*data.wide$A+
+            coef_time_varying_cov[["L"]]*data.wide$L+
+            coef_time_varying_cov[["transf(n.event, delta, sigmoid_type)"]]*
+            transf(data.wide$n.event,delta,sigmoid_type)+coef_time_varying_cov[[
+            "A:transf(n.event, delta, sigmoid_type)"]]*
+            data.wide$A*transf(data.wide$n.event,delta,sigmoid_type)))
+        ## Return a single line data frame for individual sigma.
+        return(data.wide[,c("id","A","L","fup","n.event","tstart","tstop","Stab_HIPCW")])
+      }else{ 
+        ## Individual sigma is censored at the first possible time point, which means 
+        ## that his/her weight equals the second part of the HIPCW weight.
+        current_dataset[,"Stab_HIPCW"]<-(
+        exp(coef_bas_cov[["A"]]*data.wide$A+coef_bas_cov[["L"]]*data.wide$L))/(
+        exp(coef_time_varying_cov[["A"]]*data.wide$A+
+            coef_time_varying_cov[["L"]]*data.wide$L+
+            coef_time_varying_cov[["transf(n.event, delta, sigmoid_type)"]]*
+            transf(data.wide$n.event,delta,sigmoid_type)+coef_time_varying_cov[[
+            "A:transf(n.event, delta, sigmoid_type)"]]*
+            data.wide$A*transf(data.wide$n.event,delta,sigmoid_type))) 
+        return(current_dataset[,
+              c("id","A","L","fup","n.event","tstart","tstop","Stab_HIPCW")])
+      }
+    }else{ 
+      ## Individual sigma is uncensored at the last point in time, i.e. s/he reaches the
+      ## prespecified maximum follow-up time. The stabilised HIPCW weight then equals the 
+      ## stabilised IPCW weight.
+      current_dataset[,"Stab_HIPCW"]<-current_dataset[,"Stab_IPCW"]
+      return(current_dataset[n_of_rows,
+              c("id","A","L","fup","n.event","tstart","tstop","Stab_HIPCW")])}})))}
+```
+
+We now apply the foregoing method to \texttt{data.long.Stab}. The resulting data frame can be readily employed to fit a weighted Poisson or Negative binomial regression with weights the HIPCW weights. This delivers the envisaged estimate of treatment effect.
+
+```{r, echo=TRUE}
+## Create the wide data frame with for each individual the records at the last point in
+## time one is uncensored, along with the stabilised HIPCW weights.
+data.wide.HIPCW<-
+  create_data_frame_last_time_records_and_HIPCW_weights(
+    n,data.long.Stab,delta,sigmoid_type)
+## Show for illustration part of the resulting data frame.
+data.wide.HIPCW[1:10,]
+```
